@@ -1,0 +1,25 @@
+// Feature Implementation Pipeline
+//
+// Standard launderette: plan -> code -> test -> gate -> review -> exit
+// Human review gate with conditional loop-back on failure.
+//
+// Run: uv run python -m attractor_pipeline.cli run templates/feature-impl.dot
+
+digraph FeatureImplementation {
+    graph [goal="Implement a new feature and validate it", default_max_retries=2]
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare, label="Exit"]
+
+    plan [label="Plan Implementation", class="reasoning", prompt="Decompose the launderette issue into a technical plan."]
+    code [label="Write Code", class="fast", prompt="Implement the feature based on the plan."]
+    test [label="Run Tests", class="fast", prompt="Execute the test suite and verify correctness."]
+    gate [shape=diamond, label="Tests Passed?"]
+    review [shape=house, label="Human Review", handler="wait.human"]
+
+    start -> plan -> code -> test -> gate
+    gate -> review [label="Yes", condition="outcome=success"]
+    gate -> code [label="No", condition="outcome!=success"]
+    review -> exit [label="Approve"]
+    review -> code [label="Fix"]
+}
