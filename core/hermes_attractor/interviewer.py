@@ -1,111 +1,136 @@
-"""Hermes-backed Interviewer for human-in-the-loop pipeline nodes.
+"""Hermes-backed Interviewer for the Attractor pipeline.
 
-Implements the Interviewer protocol from attractor_pipeline.handlers.human
-using stdin/stdout for interactive human input. This is the CLI/terminal
-bridge that will later be replaced by Hermes' delegation system.
+Routes human-gate questions to Hermes clarify() via the CLI. When the
+Hermes CLI is not available, falls back to console input (stdin).
 
-Usage::
-
-    interviewer = HermesInterviewer()
-    handler = HumanHandler(interviewer=interviewer)
-    registry.register("wait.human", handler)
+If a LinearSync is configured, posts the question as a comment on the
+associated Linear issue for visibility.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
+import subprocess
+import sys
+from typing import Any
 
 from attractor_pipeline.handlers.human import Answer, Question
 
+log = logging.getLogger(__name__)
+
 
 class HermesInterviewer:
-    """Interviewer that prompts on stdout and reads from stdin.
+    """Interviewer that routes human-gate questions to Hermes clarify.
 
-    Satisfies the Interviewer protocol: ``ask(Question) -> Answer``.
-
-    For now, this uses simple blocking stdin input. When Hermes bridge
-    is wired up, this will delegate to Hermes' task system instead.
+    Tries `hermes clarify` CLI first. Falls back to stdin when the CLI
+    is unavailable or in non-interactive mode (e.g., piped stdin).
     """
 
-    async def ask(self, question: Question) -> Answer:
-        """Ask the human a question and wait for a response via stdin.
-
-        Prints the question text and options to stdout, then reads
-        an answer from stdin (blocking). Runs input() in a thread
-        to avoid blocking the event loop.
+    def __init__(
+        self,
+        *,
+        issue_id: str | None = None,
+        linear_sync: Any | None = None,
+    ) -> None:
+        """Initialize the interviewer.
 
         Args:
-            question: Structured Question descriptor with text, options,
-                type hint, default, and metadata.
+            issue_id: Optional Linear issue ID for posting questions.
+            linear_sync: Optional LinearSync instance for posting
+                questions as Linear comments.
+        """
+        self._issue_id = issue_id
+        self._linear_sync = linear_sync
+
+    async def ask(self, question: Question) -> Answer:
+        """Ask a human via Hermes clarify or console fallback.
+
+        Posts the question to Linear for visibility, then tries the
+        Hermes CLI. Falls back to stdin if CLI is unavailable.
+
+        Args:
+            question: The Question object from the pipeline engine.
 
         Returns:
-            Answer with the human's response value, selected option
-            match (if applicable), and display text.
+            An Answer with the user's response.
         """
-        # Build the prompt
-        prompt_parts = [f"\n{'='*60}"]
-        prompt_parts.append(f"[HERMES HUMAN GATE: {question.stage}]")
-        prompt_parts.append(question.text)
-
-        if question.options:
-            prompt_parts.append("Options:")
-            for i, option in enumerate(question.options, 1):
-                prompt_parts.append(f"  {i}. {option}")
-            prompt_parts.append("Enter your choice (number or text):")
-        else:
-            prompt_parts.append("Enter your response:")
-
-        if question.default:
-            prompt_parts.append(f"(Default: {question.default})")
-
-        prompt_parts.append(f"{'='*60}")
-        prompt_parts.append("> ")
-
-        full_prompt = "\n".join(prompt_parts)
-
-        # Read answer — auto-approve in non-interactive mode
-        import sys
-
-        if not sys.stdin.isatty():
-            # Non-interactive: auto-approve with first option or default
+        # Post to Linear if configured
+        if self._linear_sync and self._issue_id:
+            options_text = ""
             if question.options:
-                value = question.options[0]
-                selected_option = value
-            else:
-                value = question.default or "approved"
-                selected_option = None
-            print(f"  [Non-interactive mode: auto-selected '{value}']")
-        else:
-            value = await asyncio.to_thread(input, full_prompt)
-            selected_option = None
+                options_text = f"\nOptions: {', '.join(str(o) for o in question.options)}"
+            self._linear_sync.post_event(
+                self._issue_id,
+                f"🤔 **Human Gate** (`{question.stage or 'unknown'}`): "
+                f"{question.text}{options_text}",
+            )
 
-        # Handle numbered option selection (only for interactive mode)
-        selected_option: str | None = None
+        # Try Hermes clarify CLI
+        try:
+            cmd = ["hermes", "clarify", "--question", question.text]
+            if question.options:
+                cmd.extend(["--choices", ",".join(str(o) for o in question.options)])
+
+            result = await asyncio.to_thread(
+                subprocess.run, cmd, capture_output=True, text=True, timeout=3600
+            )
+            if result.returncode == 0:
+                value = result.stdout.strip()
+                selected = value if (question.options and value in question.options) else None
+                # Post answer to Linear
+                if self._linear_sync and self._issue_id:
+                    self._linear_sync.post_event(
+                        self._issue_id,
+                        f"👤 **Human responded**: {value}",
+                    )
+                return Answer(value=value, selected_option=selected, text=value)
+
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            log.warning("[HERMES INTERVIEWER] CLI not available, falling back to console")
+
+        # Console fallback
+        return await self._ask_console(question)
+
+    async def _ask_console(self, question: Question) -> Answer:
+        """Fall back to console input for human-gate questions.
+
+        In non-interactive mode (piped stdin), auto-approves by
+        selecting the first option or the default.
+        """
+        # Print question and options
+        print(f"\n{'=' * 60}")
+        print(f"[HERMES HUMAN GATE: {question.stage or 'unknown'}]")
+        print(question.text)
+
         if question.options:
-            try:
-                idx = int(value) - 1
-                if 0 <= idx < len(question.options):
-                    value = question.options[idx]
-                    selected_option = value
-            except (ValueError, IndexError):
-                pass
+            print("\nOptions:")
+            for i, opt in enumerate(question.options, 1):
+                print(f"  {i}. {opt}")
 
-            # If the raw value matches an option directly, mark it
-            if value in question.options:
-                selected_option = value
+        # Auto-approve in non-interactive mode
+        if not sys.stdin.isatty():
+            default_value = question.default or ""
+            if question.options and not default_value:
+                default_value = str(question.options[0])
+            print(f"\n  [Non-interactive mode: auto-selected '{default_value}']")
+            selected = default_value if (question.options and default_value in question.options) else None
+            return Answer(value=default_value, selected_option=selected, text=default_value)
 
-        # Fall back to default if empty
-        if not value.strip() and question.default:
+        # Interactive: prompt for input
+        prompt_text = "\n> "
+        value = await asyncio.to_thread(input, prompt_text)
+        value = value.strip()
+
+        if not value and question.default:
             value = question.default
-            if question.options and value in question.options:
-                selected_option = value
 
-        return Answer(
-            value=value,
-            selected_option=selected_option,
-            text=value,
-        )
+        # Handle numbered option selection
+        if question.options and value.isdigit():
+            idx = int(value) - 1
+            if 0 <= idx < len(question.options):
+                value = str(question.options[idx])
 
-    async def ask_question(self, question: Question) -> Answer:
-        """Compatibility alias for ask()."""
-        return await self.ask(question)
+        selected = value if (question.options and value in question.options) else None
+        return Answer(value=value, selected_option=selected, text=value)

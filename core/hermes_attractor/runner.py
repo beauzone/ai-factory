@@ -6,9 +6,12 @@ registry with our custom components, and runs the pipeline.
 
 Usage::
 
-    runner = HermesPipelineRunner()
-    result = await runner.run("pipelines/hello_hermes.dot")
-    print(f"Status: {result.status}")
+    from core.linear_sync import LinearSync
+    from core.hermes_attractor.runner import HermesPipelineRunner
+
+    sync = LinearSync(api_key="...", team_id="...")
+    runner = HermesPipelineRunner(linear_sync=sync, issue_id="BEA-117")
+    result = await runner.run("pipelines/mt-02.dot")
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from attractor_pipeline.engine.runner import (
 from attractor_pipeline.handlers.codergen import CodergenHandler
 from attractor_pipeline.handlers.human import HumanHandler
 from attractor_pipeline.parser import parse_dot
+from attractor_pipeline.stylesheet import apply_stylesheet
 from attractor_pipeline.validation import validate_or_raise
 
 from core.hermes_attractor.backends import HermesCodergenBackend
@@ -36,9 +40,10 @@ from core.hermes_attractor.linear_sink import LinearSink
 class HermesPipelineRunner:
     """Main entry point for running Attractor pipelines with Hermes integration.
 
-    Loads a .dot pipeline file, configures the handler registry with
-    Hermes-specific backends and interviewer, runs the pipeline, and
-    reports results through the Linear event sink.
+    Loads a .dot pipeline file, applies model stylesheet routing,
+    configures the handler registry with Hermes-specific backends and
+    interviewer, runs the pipeline, and reports results through the
+    Linear event sink.
 
     Example::
 
@@ -48,26 +53,50 @@ class HermesPipelineRunner:
             print("Pipeline succeeded!")
     """
 
+    # Default model stylesheet: frontier → Opus, everything else → Sonnet
+    DEFAULT_STYLESHEET = (
+        "* { llm_model: claude-sonnet-4-5; llm_provider: anthropic; }"
+        " .frontier { llm_model: claude-opus-4-6; reasoning_effort: high; }"
+        " .fast { llm_model: claude-sonnet-4-5; reasoning_effort: low; }"
+    )
+
     def __init__(
         self,
         *,
         default_model: str = "claude-sonnet-4-5",
         default_provider: str | None = None,
-        linear_issue_id: str | None = None,
+        linear_sync: Any | None = None,
+        issue_id: str | None = None,
+        stylesheet: str | None = None,
+        dry_run: bool = False,
+        workdir: str | None = None,
     ) -> None:
         """Initialize the runner with Hermes components.
 
         Args:
             default_model: Default LLM model for codergen nodes.
             default_provider: Default LLM provider for codergen nodes.
-            linear_issue_id: Optional Linear issue ID for event tracking.
+            linear_sync: Optional LinearSync instance for posting events
+                to Linear. If None, events are only logged to stdout.
+            issue_id: Optional Linear issue ID (e.g., "BEA-117") for
+                associating pipeline events with a specific issue.
+            stylesheet: Optional CSS-like model stylesheet string for
+                routing models to node classes. If None, uses the
+                default stylesheet (frontier→Opus, fast→Sonnet).
+                The DOT file's model_stylesheet attribute takes precedence.
+            dry_run: If True, don't call the Hermes CLI — return structured
+                JSON payloads instead. Useful for testing and inspection.
+            workdir: Working directory for subagent tasks.
         """
         self._backend = HermesCodergenBackend(
             default_model=default_model,
             default_provider=default_provider,
+            workdir=workdir,
+            dry_run=dry_run,
         )
         self._interviewer = HermesInterviewer()
-        self._linear_sink = LinearSink(issue_id=linear_issue_id)
+        self._linear_sink = LinearSink(linear_sync=linear_sync, issue_id=issue_id)
+        self._stylesheet = stylesheet
 
     def _build_registry(self) -> HandlerRegistry:
         """Build a HandlerRegistry with Hermes-specific handlers.
@@ -117,6 +146,16 @@ class HermesPipelineRunner:
         # Parse
         source = path.read_text(encoding="utf-8")
         graph = parse_dot(source)
+
+        # Apply stylesheet routing (graph attribute takes precedence)
+        if graph.model_stylesheet:
+            apply_stylesheet(graph)
+        elif self._stylesheet:
+            # Inject our default stylesheet if the DOT file doesn't have one
+            graph.model_stylesheet = self._stylesheet
+            apply_stylesheet(graph)
+        else:
+            apply_stylesheet(graph)  # Apply default stylesheet
 
         # Validate
         validate_or_raise(graph)
@@ -184,6 +223,16 @@ class HermesPipelineRunner:
             ValueError: If the DOT source fails validation.
         """
         graph = parse_dot(dot_source)
+
+        # Apply stylesheet routing
+        if graph.model_stylesheet:
+            apply_stylesheet(graph)
+        elif self._stylesheet:
+            graph.model_stylesheet = self._stylesheet
+            apply_stylesheet(graph)
+        else:
+            apply_stylesheet(graph)
+
         validate_or_raise(graph)
 
         self._linear_sink.on_event("pipeline.started", {
