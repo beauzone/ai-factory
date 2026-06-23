@@ -1,0 +1,34 @@
+digraph hello_hermes {
+    graph [
+        label="Hello Hermes Pipeline",
+        goal="Demonstrate the Hermes-Attractor integration bridge"
+    ];
+
+    // Entry point
+    start [shape=Mdiamond, label="Start"];
+
+    // LLM-powered code generation node
+    generate [
+        shape=box,
+        label="Generate Code",
+        class=".frontier",
+        prompt="Generate a hello world function that demonstrates the Hermes-Attractor bridge. Return the code only.",
+        llm_model="claude-sonnet-4-5"
+    ];
+
+    // Human approval gate
+    review [
+        shape=house,
+        label="Review Output",
+        prompt="Review the generated code. Approve or request changes?"
+    ];
+
+    // Exit point
+    end [shape=Msquare, label="Done"];
+
+    // Edges
+    start -> generate;
+    generate -> review [label="success"];
+    review -> end [label="approve"];
+    review -> generate [label="revise", weight=0.5];
+}

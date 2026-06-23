@@ -1,0 +1,8 @@
+digraph G {
+    Start [shape=Mdiamond, label="Start"];
+    End [shape=Msquare, label="End"];
+    
+    Start -> Step1;
+    Step1 [label="Hello World", class=".frontier"];
+    Step1 -> End;
+}
